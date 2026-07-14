@@ -992,6 +992,107 @@ static void retr_complete(pool *p) {
   retr_fh = NULL;
 }
 
+static void xfer_delete_aborted_hidden_store(pool *p, const char *path_hidden) {
+  pool *tmp_pool;
+  char *dir_path, *base_name, *incomplete_name, *incomplete_dir;
+  char *incomplete_path;
+  const char *ptr;
+  struct stat st;
+  int res, xerrno;
+  pr_error_t *err = NULL;
+
+  tmp_pool = make_sub_pool(p);
+
+  ptr = strrchr(path_hidden, '/');
+  if (ptr != NULL) {
+    dir_path = pstrndup(tmp_pool, path_hidden, ptr - path_hidden);
+    base_name = pstrdup(tmp_pool, ptr + 1);
+
+  } else {
+    dir_path = pstrdup(tmp_pool, ".");
+    base_name = pstrdup(tmp_pool, path_hidden);
+  }
+
+  /* Strip the leading '.' from the HiddenStores file name (e.g. turn
+   * ".in.foo" into "in.foo"), since the file no longer needs to be hidden
+   * once it has been moved into Incomplete/.
+   */
+  if (*base_name == '.') {
+    incomplete_name = base_name + 1;
+
+  } else {
+    incomplete_name = base_name;
+  }
+
+  incomplete_dir = pdircat(tmp_pool, dir_path, "Incomplete", NULL);
+
+  if (pr_fsio_stat(incomplete_dir, &st) == 0 &&
+      S_ISDIR(st.st_mode)) {
+    incomplete_path = pdircat(tmp_pool, incomplete_dir, incomplete_name, NULL);
+
+    pr_log_debug(DEBUG5, "moving aborted HiddenStores file '%s' to '%s'",
+      path_hidden, incomplete_path);
+
+    res = pr_fsio_rename_with_error(tmp_pool, path_hidden, incomplete_path,
+      &err);
+    xerrno = errno;
+
+    if (res == 0) {
+      destroy_pool(tmp_pool);
+      return;
+    }
+
+    pr_error_set_where(err, &xfer_module, __FILE__, __LINE__ - 8);
+    pr_error_set_why(err, pstrcat(tmp_pool, "move aborted HiddenStores file '",
+      path_hidden, "' to '", incomplete_path, "'", NULL));
+
+    if (xerrno != ENOENT) {
+      if (err != NULL) {
+        pr_log_debug(DEBUG0, "%s", pr_error_strerror(err, 0));
+
+      } else {
+        pr_log_debug(DEBUG0, "error moving HiddenStores file '%s' to '%s': %s",
+          path_hidden, incomplete_path, strerror(xerrno));
+      }
+    }
+
+    if (err != NULL) {
+      pr_error_destroy(err);
+      err = NULL;
+    }
+
+    /* Fall through to the delete-as-fallback path below. */
+  }
+
+  pr_log_debug(DEBUG5, "removing aborted HiddenStores file '%s'", path_hidden);
+
+  res = pr_fsio_unlink_with_error(tmp_pool, path_hidden, &err);
+  xerrno = errno;
+
+  if (res < 0) {
+    pr_error_set_where(err, &xfer_module, __FILE__, __LINE__ - 5);
+    pr_error_set_why(err, pstrcat(tmp_pool, "delete HiddenStores file '",
+      path_hidden, "'", NULL));
+
+    if (xerrno != ENOENT) {
+      if (err != NULL) {
+        pr_log_debug(DEBUG0, "%s", pr_error_strerror(err, 0));
+
+      } else {
+        pr_log_debug(DEBUG0, "error deleting HiddenStores file '%s': %s",
+          path_hidden, strerror(xerrno));
+      }
+    }
+
+    if (err != NULL) {
+      pr_error_destroy(err);
+      err = NULL;
+    }
+  }
+
+  destroy_pool(tmp_pool);
+}
+
 static void stor_abort(pool *p) {
   int res, xerrno = 0;
   pool *tmp_pool;
@@ -1037,35 +1138,11 @@ static void stor_abort(pool *p) {
   if (session.xfer.xfer_type == STOR_HIDDEN) {
     if (delete_stores == NULL ||
         *delete_stores == TRUE) {
-      /* If a hidden store was aborted, remove only hidden file, not real
-       * one.
+      /* If a hidden store was aborted, remove (or move to Incomplete/) only
+       * the hidden file, not the real one.
        */
       if (session.xfer.path_hidden) {
-        pr_log_debug(DEBUG5, "removing aborted HiddenStores file '%s'",
-          session.xfer.path_hidden);
-
-        res = pr_fsio_unlink_with_error(tmp_pool, session.xfer.path_hidden,
-          &err);
-        xerrno = errno;
-
-        if (res < 0) {
-          pr_error_set_where(err, &xfer_module, __FILE__, __LINE__ - 5);
-          pr_error_set_why(err, pstrcat(tmp_pool, "delete HiddenStores file '",
-            session.xfer.path_hidden, "'", NULL));
-
-          if (xerrno != ENOENT) {
-            if (err != NULL) {
-              pr_log_debug(DEBUG0, "%s", pr_error_strerror(err, 0));
-
-            } else {
-              pr_log_debug(DEBUG0, "error deleting HiddenStores file '%s': %s",
-                session.xfer.path_hidden, strerror(xerrno));
-            }
-          }
-
-          pr_error_destroy(err);
-          err = NULL;
-        }
+        xfer_delete_aborted_hidden_store(tmp_pool, session.xfer.path_hidden);
       }
     }
 
@@ -3414,7 +3491,7 @@ MODRET xfer_smnt(cmd_rec *cmd) {
 
 MODRET xfer_err_cleanup(cmd_rec *cmd) {
 
-  /* If a hidden store was aborted, remove it. */
+  /* If a hidden store was aborted, remove it (or move it to Incomplete/). */
   if (session.xfer.xfer_type == STOR_HIDDEN) {
     unsigned char *delete_stores = NULL;
 
@@ -3422,14 +3499,8 @@ MODRET xfer_err_cleanup(cmd_rec *cmd) {
     if (delete_stores == NULL ||
         *delete_stores == TRUE) {
       if (session.xfer.path_hidden) {
-        pr_log_debug(DEBUG5, "removing aborted HiddenStores file '%s'",
+        xfer_delete_aborted_hidden_store(cmd->tmp_pool,
           session.xfer.path_hidden);
-        if (pr_fsio_unlink(session.xfer.path_hidden) < 0) {
-          if (errno != ENOENT) {
-            pr_log_debug(DEBUG0, "error deleting HiddenStores file '%s': %s",
-              session.xfer.path_hidden, strerror(errno));
-          }
-        }
       }
     }
   }
